@@ -1,0 +1,5 @@
+{
+  "name": "TourGuide Live",
+  "description": "Live audio broadcasting and real-time GPS tracking for tour guides and their clients.",
+  "requestFramePermissions": ["microphone", "geolocation"]
+}
