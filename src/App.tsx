@@ -1,801 +1,610 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import mapboxgl from "mapbox-gl";
-import { Mic, MicOff, MapPin, Users, Radio, Play, Pause, Settings, Info } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import "mapbox-gl/dist/mapbox-gl.css";
+import {
+  Mic, MicOff, MapPin, Users, Radio, Camera,
+  MessageCircle, Send, X, Image, Wifi, WifiOff, LogOut
+} from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import { requestNotificationPermission, showLocalNotification } from "./hooks/useNotifications";
+import { useWebRTC } from "./hooks/useWebRTC";
 
-// Types
+// ── i18n ───────────────────────────────────────────────────────
+const T = {
+  it: {
+    appTagline: "Audio e GPS in tempo reale per il tuo tour",
+    groupCode: "Codice Gruppo",
+    groupPlaceholder: "Es: CAPRI2026",
+    joinAsGuide: "Guida",
+    joinAsClient: "Partecipante",
+    join: "Entra",
+    guide: "Guida",
+    client: "Partecipante",
+    startBroadcast: "Inizia Trasmissione",
+    stopBroadcast: "Ferma Trasmissione",
+    broadcasting: "In trasmissione",
+    waiting: "In attesa...",
+    connected: "Connesso",
+    disconnected: "Disconnesso",
+    clients: "Partecipanti",
+    sendPhoto: "Invia Foto",
+    chat: "Chat",
+    map: "Mappa",
+    typeMessage: "Scrivi un messaggio...",
+    send: "Invia",
+    guideJoined: "La guida è entrata",
+    guideLeft: "La guida ha lasciato la stanza",
+    broadcastStarted: "Trasmissione avviata!",
+    broadcastStopped: "Trasmissione interrotta",
+    roomFull: "Gruppo pieno (max 100)",
+    leave: "Esci",
+    micPermission: "Permesso microfono negato",
+    guideLabel: "👨‍✈️ Guida",
+    youLabel: "Tu",
+    photoCaption: "Aggiungi una didascalia...",
+    sendPhotoBtn: "Invia Foto",
+    cancel: "Annulla",
+    noMapToken: "Mappa non disponibile: configura VITE_MAPBOX_ACCESS_TOKEN",
+    listenLabel: "Ascolta la guida",
+    audioConnected: "Audio connesso",
+    audioWaiting: "In attesa audio...",
+  },
+  en: {
+    appTagline: "Real-time audio & GPS for your tour",
+    groupCode: "Group Code",
+    groupPlaceholder: "E.g.: CAPRI2026",
+    joinAsGuide: "Guide",
+    joinAsClient: "Participant",
+    join: "Join",
+    guide: "Guide",
+    client: "Participant",
+    startBroadcast: "Start Broadcast",
+    stopBroadcast: "Stop Broadcast",
+    broadcasting: "Broadcasting",
+    waiting: "Waiting...",
+    connected: "Connected",
+    disconnected: "Disconnected",
+    clients: "Participants",
+    sendPhoto: "Send Photo",
+    chat: "Chat",
+    map: "Map",
+    typeMessage: "Type a message...",
+    send: "Send",
+    guideJoined: "Guide has joined",
+    guideLeft: "Guide has left the room",
+    broadcastStarted: "Broadcast started!",
+    broadcastStopped: "Broadcast stopped",
+    roomFull: "Group full (max 100)",
+    leave: "Leave",
+    micPermission: "Microphone permission denied",
+    guideLabel: "👨‍✈️ Guide",
+    youLabel: "You",
+    photoCaption: "Add a caption...",
+    sendPhotoBtn: "Send Photo",
+    cancel: "Cancel",
+    noMapToken: "Map unavailable: set VITE_MAPBOX_ACCESS_TOKEN",
+    listenLabel: "Listen to guide",
+    audioConnected: "Audio connected",
+    audioWaiting: "Waiting for audio...",
+  },
+};
+
+type Lang = "it" | "en";
 type Role = "guide" | "client" | null;
 
+interface ChatMsg {
+  id: string;
+  author: string;
+  message: string;
+  role: "guide" | "client";
+  timestamp: number;
+}
+
+interface PhotoMsg {
+  guideId: string;
+  dataUrl: string;
+  caption: string;
+  timestamp: number;
+}
+
+// ── MAIN APP ───────────────────────────────────────────────────
 export default function App() {
+  const [lang, setLang] = useState<Lang>("it");
+  const t = T[lang];
+
   const [role, setRole] = useState<Role>(null);
   const [roomId, setRoomId] = useState("");
   const [isJoined, setIsJoined] = useState(false);
+  const [isBroadcasting, setIsBroadcasting] = useState(false);
+  const [micOn, setMicOn] = useState(true);
+  const [clientCount, setClientCount] = useState(0);
+  const [guidePresent, setGuidePresent] = useState(false);
+  const [audioConnected, setAudioConnected] = useState(false);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
 
+  const [tab, setTab] = useState<"map" | "chat" | "photos">("map");
+  const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
+  const [photos, setPhotos] = useState<PhotoMsg[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [photoPreview, setPhotoPreview] = useState<string | null>(null);
+  const [photoCaption, setPhotoCaption] = useState("");
+  const [username, setUsername] = useState("");
+
+  const socketRef = useRef<Socket | null>(null);
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<mapboxgl.Map | null>(null);
+  const guideMarkerRef = useRef<mapboxgl.Marker | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const chatBottomRef = useRef<HTMLDivElement | null>(null);
+  const localStreamRef2 = useRef<MediaStream | null>(null);
+
+  const { sendOffer, handleOffer, handleAnswer, handleIceCandidate, closeAll, peerConnections } =
+    useWebRTC(socketRef.current);
+
+  // ── Network status ──────────────────────────────────────────
+  useEffect(() => {
+    const up = () => setIsOnline(true);
+    const dn = () => setIsOnline(false);
+    window.addEventListener("online", up);
+    window.addEventListener("offline", dn);
+    return () => { window.removeEventListener("online", up); window.removeEventListener("offline", dn); };
+  }, []);
+
+  // ── Socket init ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!isJoined) return;
+
+    const socket = io(window.location.origin, { transports: ["websocket", "polling"] });
+    socketRef.current = socket;
+
+    socket.emit("join-room", roomId, role);
+
+    socket.on("room-info", (info: { guidePresent: boolean; broadcastActive: boolean; clientCount: number }) => {
+      setGuidePresent(info.guidePresent);
+      setClientCount(info.clientCount);
+      if (info.broadcastActive) showLocalNotification("Tony's Family", t.broadcastStarted);
+    });
+
+    socket.on("room-clients", (clients: string[]) => setClientCount(clients.length));
+    socket.on("client-joined", (clientId: string) => {
+      setClientCount((n) => n + 1);
+      if (isBroadcasting && localStreamRef2.current) {
+        sendOffer(clientId, localStreamRef2.current);
+      }
+    });
+    socket.on("client-left", () => setClientCount((n) => Math.max(0, n - 1)));
+
+    socket.on("send-offer-to", (clientId: string) => {
+      if (localStreamRef2.current) sendOffer(clientId, localStreamRef2.current);
+    });
+
+    // WebRTC
+    socket.on("offer", async ({ sender, offer }: { sender: string; offer: RTCSessionDescriptionInit }) => {
+      await handleOffer(sender, offer, (stream) => {
+        setAudioConnected(true);
+        if (!audioRef.current) {
+          audioRef.current = new Audio();
+          audioRef.current.autoplay = true;
+        }
+        audioRef.current.srcObject = stream;
+        audioRef.current.play().catch(() => {});
+      });
+    });
+
+    socket.on("answer", ({ sender, answer }: { sender: string; answer: RTCSessionDescriptionInit }) => {
+      handleAnswer(sender, answer);
+    });
+
+    socket.on("ice-candidate", ({ sender, candidate }: { sender: string; candidate: RTCIceCandidateInit }) => {
+      handleIceCandidate(sender, candidate);
+    });
+
+    // Guide presence
+    socket.on("guide-joined", () => {
+      setGuidePresent(true);
+      showLocalNotification("Tony's Family", t.guideJoined);
+    });
+    socket.on("guide-left", () => {
+      setGuidePresent(false);
+      setAudioConnected(false);
+      if (audioRef.current) { audioRef.current.srcObject = null; }
+    });
+
+    // Broadcast events
+    socket.on("broadcast-started", () => {
+      showLocalNotification("Tony's Family", t.broadcastStarted);
+    });
+    socket.on("broadcast-stopped", () => {
+      setAudioConnected(false);
+      if (audioRef.current) audioRef.current.srcObject = null;
+    });
+
+    // Chat
+    socket.on("chat-message", (msg: ChatMsg) => {
+      setChatMessages((prev) => [...prev, msg]);
+      if (tab !== "chat") showLocalNotification("Tony's Family", `${msg.author}: ${msg.message}`);
+    });
+
+    // Photos
+    socket.on("photo-received", (photo: PhotoMsg) => {
+      setPhotos((prev) => [photo, ...prev]);
+      if (tab !== "photos") showLocalNotification("Tony's Family", `📸 ${photo.caption || "Nuova foto"}`);
+    });
+
+    socket.on("room-full", () => alert(t.roomFull));
+
+    return () => {
+      socket.disconnect();
+      closeAll();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isJoined]);
+
+  // Auto-scroll chat
+  useEffect(() => {
+    chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages]);
+
+  // ── Mapbox ──────────────────────────────────────────────────
+  useEffect(() => {
+    if (!isJoined || tab !== "map") return;
+    const token = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN;
+    if (!token || !mapContainerRef.current || mapRef.current) return;
+
+    mapboxgl.accessToken = token;
+    const map = new mapboxgl.Map({
+      container: mapContainerRef.current,
+      style: "mapbox://styles/mapbox/streets-v12",
+      center: [14.2369, 40.5502], // Capri
+      zoom: 14,
+    });
+    mapRef.current = map;
+
+    if (!socketRef.current) return;
+    socketRef.current.on("location-updated", ({ location }: { location: { lat: number; lng: number } }) => {
+      const lngLat: [number, number] = [location.lng, location.lat];
+      if (guideMarkerRef.current) {
+        guideMarkerRef.current.setLngLat(lngLat);
+      } else {
+        const el = document.createElement("div");
+        el.className = "guide-marker";
+        el.innerHTML = `<div style="width:40px;height:40px;background:#1a6fa8;border:3px solid #fff;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 12px rgba(0,0,0,0.3);font-size:18px;">🎙️</div>`;
+        guideMarkerRef.current = new mapboxgl.Marker({ element: el }).setLngLat(lngLat).addTo(map);
+      }
+      map.flyTo({ center: lngLat, zoom: 16, speed: 0.8 });
+    });
+  }, [isJoined, tab]);
+
+  // ── GPS broadcast (guide) ───────────────────────────────────
+  useEffect(() => {
+    if (!isBroadcasting || role !== "guide") return;
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        socketRef.current?.emit("update-location", {
+          roomId,
+          location: { lat: pos.coords.latitude, lng: pos.coords.longitude },
+        });
+      },
+      console.warn,
+      { enableHighAccuracy: true, maximumAge: 3000 }
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [isBroadcasting, role, roomId]);
+
+  // ── Handlers ────────────────────────────────────────────────
+  const handleJoin = useCallback(async () => {
+    if (!roomId.trim() || !role) return;
+    await requestNotificationPermission();
+    setIsJoined(true);
+    setUsername(role === "guide" ? t.guideLabel : `${t.client} ${Math.floor(Math.random() * 900 + 100)}`);
+  }, [roomId, role, t]);
+
+  const handleStartBroadcast = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      localStreamRef2.current = stream;
+      setIsBroadcasting(true);
+      socketRef.current?.emit("start-broadcast", roomId);
+      // Send offers to already-connected clients
+      peerConnections.current.forEach((_, clientId) => sendOffer(clientId, stream));
+    } catch {
+      alert(t.micPermission);
+    }
+  }, [roomId, t, sendOffer, peerConnections]);
+
+  const handleStopBroadcast = useCallback(() => {
+    localStreamRef2.current?.getTracks().forEach((t) => t.stop());
+    localStreamRef2.current = null;
+    setIsBroadcasting(false);
+    socketRef.current?.emit("stop-broadcast", roomId);
+    closeAll();
+  }, [roomId, closeAll]);
+
+  const toggleMic = useCallback(() => {
+    if (!localStreamRef2.current) return;
+    localStreamRef2.current.getAudioTracks().forEach((t) => (t.enabled = !t.enabled));
+    setMicOn((v) => !v);
+  }, []);
+
+  const sendChat = useCallback(() => {
+    if (!chatInput.trim()) return;
+    socketRef.current?.emit("chat-message", {
+      roomId,
+      message: chatInput.trim(),
+      author: username,
+      role,
+    });
+    setChatInput("");
+  }, [chatInput, roomId, username, role]);
+
+  const handlePhotoSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => setPhotoPreview(ev.target?.result as string);
+    reader.readAsDataURL(file);
+  }, []);
+
+  const sendPhoto = useCallback(() => {
+    if (!photoPreview) return;
+    socketRef.current?.emit("send-photo", { roomId, dataUrl: photoPreview, caption: photoCaption });
+    setPhotoPreview(null);
+    setPhotoCaption("");
+  }, [photoPreview, photoCaption, roomId]);
+
+  const handleLeave = useCallback(() => {
+    closeAll();
+    socketRef.current?.disconnect();
+    setIsJoined(false);
+    setIsBroadcasting(false);
+    setAudioConnected(false);
+    setClientCount(0);
+    setChatMessages([]);
+    setPhotos([]);
+  }, [closeAll]);
+
+  // ── JOIN SCREEN ─────────────────────────────────────────────
   if (!isJoined) {
     return (
-      <div className="min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-4 font-sans">
-        <motion.div 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="w-full max-w-md"
-        >
-          <Card className="bg-zinc-900 border-zinc-800 text-zinc-100 shadow-2xl">
-            <CardHeader className="text-center">
-              <div className="mx-auto w-16 h-16 bg-orange-500 rounded-2xl flex items-center justify-center mb-4 shadow-lg shadow-orange-500/20">
-                <Radio className="w-8 h-8 text-white" />
-              </div>
-              <CardTitle className="text-3xl font-bold tracking-tight">TourGuide Live</CardTitle>
-              <CardDescription className="text-zinc-400">
-                Trasmetti audio e posizione GPS in tempo reale
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              <div className="space-y-2">
-                <Label htmlFor="roomId">Codice Gruppo</Label>
-                <Input 
-                  id="roomId" 
-                  placeholder="Es: ROMA2024" 
-                  value={roomId}
-                  onChange={(e) => setRoomId(e.target.value.toUpperCase())}
-                  className="bg-zinc-800 border-zinc-700 focus:ring-orange-500"
-                />
-              </div>
+      <div className="min-h-screen flex flex-col items-center justify-center p-4"
+        style={{ background: "linear-gradient(160deg, #0a3d62 0%, #1a6fa8 50%, #2980b9 100%)" }}>
+        {/* Lang toggle */}
+        <div className="absolute top-4 right-4 flex gap-2">
+          {(["it", "en"] as Lang[]).map((l) => (
+            <button key={l} onClick={() => setLang(l)}
+              className={`px-3 py-1 rounded-full text-sm font-semibold transition-all ${lang === l ? "bg-white text-blue-900" : "bg-white/20 text-white hover:bg-white/30"}`}>
+              {l.toUpperCase()}
+            </button>
+          ))}
+        </div>
 
-              {!import.meta.env.VITE_MAPBOX_ACCESS_TOKEN && (
-                <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl flex items-start gap-3">
-                  <Info className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-                  <p className="text-xs text-amber-200/70">
-                    Mappa disabilitata: Inserisci il tuo Mapbox Access Token nei segreti (VITE_MAPBOX_ACCESS_TOKEN).
-                  </p>
-                </div>
-              )}
-              
-              <div className="grid grid-cols-2 gap-4">
-                <Button 
-                  variant={role === "guide" ? "default" : "outline"}
-                  className={`h-24 flex flex-col gap-2 ${role === "guide" ? "bg-orange-600 hover:bg-orange-700 border-none" : "border-zinc-700 hover:bg-zinc-800"}`}
-                  onClick={() => setRole("guide")}
-                >
-                  <Mic className="w-6 h-6" />
-                  <span>Guida</span>
-                </Button>
-                <Button 
-                  variant={role === "client" ? "default" : "outline"}
-                  className={`h-24 flex flex-col gap-2 ${role === "client" ? "bg-orange-600 hover:bg-orange-700 border-none" : "border-zinc-700 hover:bg-zinc-800"}`}
-                  onClick={() => setRole("client")}
-                >
-                  <Users className="w-6 h-6" />
-                  <span>Cliente</span>
-                </Button>
-              </div>
-            </CardContent>
-            <CardFooter>
-              <Button 
-                className="w-full bg-orange-600 hover:bg-orange-700 text-white font-bold h-12"
-                disabled={!role || !roomId}
-                onClick={() => setIsJoined(true)}
-              >
-                Entra nel Gruppo
-              </Button>
-            </CardFooter>
-          </Card>
-          
-          <p className="text-center mt-6 text-zinc-500 text-sm">
-            Sviluppato per guide turistiche professioniste
-          </p>
+        <motion.div initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.5 }}
+          className="w-full max-w-sm">
+          {/* Logo */}
+          <div className="text-center mb-8">
+            <div className="mx-auto w-20 h-20 rounded-3xl flex items-center justify-center mb-4 shadow-2xl"
+              style={{ background: "rgba(255,255,255,0.15)", backdropFilter: "blur(10px)", border: "1px solid rgba(255,255,255,0.3)" }}>
+              <svg viewBox="0 0 48 48" width="44" height="44" fill="none">
+                <circle cx="24" cy="24" r="22" stroke="white" strokeWidth="2.5" />
+                <path d="M14 24 Q24 10 34 24 Q24 38 14 24Z" fill="white" opacity="0.9" />
+                <circle cx="24" cy="24" r="4" fill="#1a6fa8" />
+                <path d="M24 8 L24 14 M24 34 L24 40 M8 24 L14 24 M34 24 L40 24" stroke="white" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+            </div>
+            <h1 className="text-3xl font-bold text-white tracking-tight">Tony's Family</h1>
+            <p className="text-blue-200 mt-1 text-sm">{t.appTagline}</p>
+          </div>
+
+          {/* Card */}
+          <div className="rounded-3xl p-6 space-y-5 shadow-2xl"
+            style={{ background: "rgba(255,255,255,0.12)", backdropFilter: "blur(20px)", border: "1px solid rgba(255,255,255,0.2)" }}>
+            <div>
+              <label className="block text-white/80 text-sm font-medium mb-1.5">{t.groupCode}</label>
+              <input
+                value={roomId}
+                onChange={(e) => setRoomId(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
+                placeholder={t.groupPlaceholder}
+                maxLength={12}
+                className="w-full px-4 py-3 rounded-2xl text-white placeholder-white/40 font-mono tracking-widest text-lg text-center focus:outline-none focus:ring-2 focus:ring-white/50"
+                style={{ background: "rgba(255,255,255,0.15)", border: "1px solid rgba(255,255,255,0.25)" }}
+                onKeyDown={(e) => e.key === "Enter" && handleJoin()}
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              {(["guide", "client"] as const).map((r) => (
+                <button key={r} onClick={() => setRole(r)}
+                  className={`py-4 rounded-2xl font-semibold flex flex-col items-center gap-2 transition-all ${role === r ? "bg-white text-blue-900 shadow-lg scale-105" : "text-white hover:bg-white/20"}`}
+                  style={role !== r ? { background: "rgba(255,255,255,0.1)", border: "1px solid rgba(255,255,255,0.2)" } : {}}>
+                  {r === "guide" ? <Radio className="w-6 h-6" /> : <Users className="w-6 h-6" />}
+                  {r === "guide" ? t.joinAsGuide : t.joinAsClient}
+                </button>
+              ))}
+            </div>
+
+            <button
+              onClick={handleJoin}
+              disabled={!roomId.trim() || !role}
+              className="w-full py-4 rounded-2xl font-bold text-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              style={{ background: role ? "white" : "rgba(255,255,255,0.3)", color: "#0a3d62" }}>
+              {t.join}
+            </button>
+          </div>
         </motion.div>
       </div>
     );
   }
 
-  return role === "guide" ? (
-    <GuideView roomId={roomId} onLeave={() => setIsJoined(false)} />
-  ) : (
-    <ClientView roomId={roomId} onLeave={() => setIsJoined(false)} />
-  );
-}
-
-const ICE_SERVERS = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun3.l.google.com:19302" },
-    { urls: "stun:stun4.l.google.com:19302" },
-  ]
-};
-
-const AUDIO_CONSTRAINTS = {
-  audio: {
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
-  }
-};
-
-// --- GUIDE VIEW ---
-function GuideView({ roomId, onLeave }: { roomId: string; onLeave: () => void }) {
-  const [isBroadcasting, setIsBroadcasting] = useState(false);
-  const [location, setLocation] = useState<{ lat: number; lng: number } | null>(null);
-  const [clientsCount, setClientsCount] = useState(0);
-  const connectedClientsRef = useRef<Set<string>>(new Set());
-  const [mapError, setMapError] = useState<string | null>(null);
-  const socketRef = useRef<Socket | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
-  const mapRef = useRef<HTMLDivElement>(null);
-  const mapInstanceRef = useRef<mapboxgl.Map | null>(null);
-  const markerRef = useRef<mapboxgl.Marker | null>(null);
-
-  const createPeerConnection = async (clientId: string, stream: MediaStream) => {
-    console.log("[EXPERT] Creating peer connection for:", clientId);
-    if (peersRef.current.has(clientId)) {
-      peersRef.current.get(clientId)?.close();
-      peersRef.current.delete(clientId);
-    }
-
-    const pc = new RTCPeerConnection(ICE_SERVERS);
-    peersRef.current.set(clientId, pc);
-
-    stream.getTracks().forEach(track => {
-      pc.addTrack(track, stream);
-    });
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        socketRef.current?.emit("ice-candidate", { target: clientId, candidate: event.candidate });
-      }
-    };
-
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socketRef.current?.emit("offer", { target: clientId, offer });
-    } catch (err) {
-      console.error("Error creating offer:", err);
-    }
-  };
-
-  useEffect(() => {
-    socketRef.current = io();
-    const socket = socketRef.current;
-
-    socket.emit("join-room", roomId, "guide");
-
-    socket.on("client-joined", async (clientId: string) => {
-      console.log("Client joined notification:", clientId);
-      if (!connectedClientsRef.current.has(clientId)) {
-        connectedClientsRef.current.add(clientId);
-        setClientsCount(connectedClientsRef.current.size);
-      }
-      
-      if (isBroadcasting && streamRef.current && !peersRef.current.has(clientId)) {
-        await createPeerConnection(clientId, streamRef.current);
-      }
-    });
-
-    socket.on("answer", async ({ sender, answer }) => {
-      console.log("Received answer from:", sender);
-      const pc = peersRef.current.get(sender);
-      if (pc) {
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(answer));
-          
-          // Process pending candidates for this client
-          const pending = pendingIceCandidatesRef.current.get(sender) || [];
-          while (pending.length > 0) {
-            const candidate = pending.shift();
-            if (candidate) await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          }
-          pendingIceCandidatesRef.current.delete(sender);
-        } catch (err) {
-          console.error("Error setting remote description/candidates:", err);
-        }
-      }
-    });
-
-    socket.on("client-left", (clientId: string) => {
-      connectedClientsRef.current.delete(clientId);
-      setClientsCount(connectedClientsRef.current.size);
-      const pc = peersRef.current.get(clientId);
-      if (pc) {
-        pc.close();
-        peersRef.current.delete(clientId);
-      }
-      pendingIceCandidatesRef.current.delete(clientId);
-    });
-
-    socket.on("ice-candidate", async ({ sender, candidate }) => {
-      const pc = peersRef.current.get(sender);
-      if (pc && pc.remoteDescription) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) { console.error("Guide error adding ICE candidate:", e); }
-      } else {
-        if (!pendingIceCandidatesRef.current.has(sender)) {
-          pendingIceCandidatesRef.current.set(sender, []);
-        }
-        pendingIceCandidatesRef.current.get(sender)?.push(candidate);
-      }
-    });
-
-    // GPS Tracking
-    const watchId = navigator.geolocation.watchPosition(
-      (pos) => {
-        const newLoc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        setLocation(newLoc);
-        socket.emit("update-location", { roomId, location: newLoc });
-        
-        if (mapInstanceRef.current) {
-          mapInstanceRef.current.setCenter([newLoc.lng, newLoc.lat]);
-          if (markerRef.current) {
-            markerRef.current.setLngLat([newLoc.lng, newLoc.lat]);
-          }
-        }
-      },
-      (err) => console.error("GPS Error:", err),
-      { enableHighAccuracy: true }
-    );
-
-    // Load Mapbox
-    const token = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN;
-    console.log("Mapbox Token present:", !!token);
-    
-    if (token && mapRef.current) {
-      try {
-        mapboxgl.accessToken = token;
-        const map = new mapboxgl.Map({
-          container: mapRef.current,
-          style: "mapbox://styles/mapbox/dark-v11",
-          center: [0, 0],
-          zoom: 15,
-          attributionControl: false,
-        });
-
-        mapInstanceRef.current = map;
-
-        const el = document.createElement('div');
-        el.className = 'w-6 h-6 bg-orange-500 rounded-full border-4 border-white shadow-lg';
-        
-        markerRef.current = new mapboxgl.Marker(el)
-          .setLngLat([0, 0])
-          .addTo(map);
-
-        map.on('load', () => {
-          console.log("Mapbox loaded successfully");
-          map.resize();
-        });
-
-        map.on('error', (e) => {
-          console.error("Mapbox Error:", e);
-          setMapError("Errore nel caricamento di Mapbox. Verifica il tuo Access Token.");
-        });
-      } catch (err) {
-        console.error("Mapbox Init Error:", err);
-        setMapError("Errore nell'inizializzazione della mappa.");
-      }
-    } else if (!token) {
-      setMapError("Mapbox Access Token mancante.");
-    }
-
-    return () => {
-      socket.disconnect();
-      navigator.geolocation.clearWatch(watchId);
-      stopBroadcasting();
-      mapInstanceRef.current?.remove();
-    };
-  }, [roomId]);
-
-  const startBroadcasting = async () => {
-    try {
-      console.log("[EXPERT] Requesting microphone with optimized constraints...");
-      const stream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
-      streamRef.current = stream;
-      setIsBroadcasting(true);
-      
-      console.log("Broadcasting started, notifying clients...");
-      socketRef.current?.emit("start-broadcast", roomId);
-    } catch (err) {
-      console.error("[EXPERT] Mic Error:", err);
-      alert("Errore Microfono: Controlla i permessi del browser.");
-    }
-  };
-
-  const stopBroadcasting = () => {
-    streamRef.current?.getTracks().forEach(track => track.stop());
-    streamRef.current = null;
-    setIsBroadcasting(false);
-    peersRef.current.forEach(pc => pc.close());
-    peersRef.current.clear();
-    socketRef.current?.emit("stop-broadcast", roomId);
-  };
-
+  // ── MAIN APP SCREEN ─────────────────────────────────────────
   return (
-    <div className="h-screen flex flex-col bg-zinc-950 text-zinc-100 overflow-hidden">
+    <div className="min-h-screen flex flex-col" style={{ background: "#f0f7ff" }}>
       {/* Header */}
-      <header className="p-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/50 backdrop-blur-md z-10">
+      <header className="flex items-center justify-between px-4 py-3 shadow-md z-10"
+        style={{ background: "linear-gradient(90deg, #0a3d62, #1a6fa8)", color: "white" }}>
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-orange-600 rounded-xl flex items-center justify-center">
-            <Radio className="w-5 h-5 text-white" />
+          <div className="w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: "rgba(255,255,255,0.2)" }}>
+            <Radio className="w-5 h-5" />
           </div>
           <div>
-            <h1 className="font-bold text-lg">TourGuide Live</h1>
-            <div className="flex items-center gap-2">
-              <Badge variant="outline" className="text-[10px] border-zinc-700 text-zinc-400">
-                GRUPPO: {roomId}
-              </Badge>
-              <Badge variant="secondary" className="bg-zinc-800 text-zinc-300 text-[10px]">
-                GUIDA
-              </Badge>
-            </div>
+            <div className="font-bold text-sm leading-tight">Tony's Family</div>
+            <div className="text-xs text-blue-200 font-mono">{roomId}</div>
           </div>
         </div>
-        <Button variant="ghost" size="sm" onClick={onLeave} className="text-zinc-400 hover:text-white">
-          Esci
-        </Button>
+        <div className="flex items-center gap-3">
+          {isOnline
+            ? <Wifi className="w-4 h-4 text-green-300" />
+            : <WifiOff className="w-4 h-4 text-red-300" />}
+          {role === "client" && (
+            <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${audioConnected ? "bg-green-500/30 text-green-200" : "bg-white/10 text-white/60"}`}>
+              <div className={`w-2 h-2 rounded-full ${audioConnected ? "bg-green-400 animate-pulse" : "bg-white/30"}`} />
+              {audioConnected ? t.audioConnected : t.audioWaiting}
+            </div>
+          )}
+          <button onClick={handleLeave} className="p-2 rounded-xl hover:bg-white/20 transition-colors">
+            <LogOut className="w-4 h-4" />
+          </button>
+        </div>
       </header>
 
-      {/* Main Content */}
-      <main className="flex-1 relative">
-        {/* Map Background */}
-        <div ref={mapRef} className="absolute inset-0 z-0" />
-        
-        {/* Map Error Overlay */}
-        {mapError && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-zinc-950/80 backdrop-blur-sm p-6 text-center">
-            <div className="max-w-xs space-y-4">
-              <div className="mx-auto w-12 h-12 bg-amber-500/20 rounded-full flex items-center justify-center">
-                <Info className="w-6 h-6 text-amber-500" />
-              </div>
-              <p className="text-sm text-zinc-300">{mapError}</p>
-              <Button variant="outline" size="sm" onClick={() => window.location.reload()} className="border-zinc-800">
-                Riprova
-              </Button>
-            </div>
+      {/* Guide controls */}
+      {role === "guide" && (
+        <div className="px-4 pt-4 pb-2 flex items-center gap-3">
+          <button
+            onClick={isBroadcasting ? handleStopBroadcast : handleStartBroadcast}
+            className={`flex-1 py-4 rounded-2xl font-bold text-lg flex items-center justify-center gap-3 transition-all shadow-lg ${isBroadcasting ? "bg-red-500 text-white" : "text-white"}`}
+            style={!isBroadcasting ? { background: "linear-gradient(90deg,#1a6fa8,#2980b9)" } : {}}>
+            {isBroadcasting
+              ? <><MicOff className="w-5 h-5" />{t.stopBroadcast}</>
+              : <><Mic className="w-5 h-5" />{t.startBroadcast}</>}
+          </button>
+          {isBroadcasting && (
+            <button onClick={toggleMic}
+              className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all shadow ${micOn ? "bg-blue-100 text-blue-700" : "bg-red-100 text-red-600"}`}>
+              {micOn ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6" />}
+            </button>
+          )}
+          {isBroadcasting && (
+            <button onClick={() => fileInputRef.current?.click()}
+              className="w-14 h-14 rounded-2xl bg-blue-100 text-blue-700 flex items-center justify-center shadow">
+              <Camera className="w-6 h-6" />
+            </button>
+          )}
+          <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handlePhotoSelect} />
+        </div>
+      )}
+
+      {/* Status bar */}
+      <div className="px-4 py-2 flex items-center gap-4 text-sm">
+        {role === "guide" && (
+          <div className="flex items-center gap-1.5 text-gray-600">
+            <Users className="w-4 h-4" />
+            <span>{clientCount} {t.clients}</span>
           </div>
         )}
-        
-        {/* Overlay Controls */}
-        <div className="absolute bottom-8 left-0 right-0 px-4 flex flex-col gap-4 z-10">
-          <motion.div 
-            initial={{ y: 20, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            className="bg-zinc-900/90 backdrop-blur-xl border border-zinc-800 rounded-3xl p-6 shadow-2xl max-w-lg mx-auto w-full"
-          >
-            <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-4">
-                <div className={`w-3 h-3 rounded-full ${isBroadcasting ? "bg-red-500 animate-pulse" : "bg-zinc-700"}`} />
-                <div>
-                  <p className="text-sm font-medium text-zinc-300">
-                    {isBroadcasting ? "In Diretta" : "Audio Spento"}
-                  </p>
-                  <p className="text-xs text-zinc-500">{clientsCount} Clienti connessi</p>
-                </div>
-              </div>
-              <div className="flex items-center gap-2 text-zinc-400">
-                <MapPin className="w-4 h-4" />
-                <span className="text-xs">GPS Attivo</span>
-              </div>
-            </div>
+        {isBroadcasting && (
+          <div className="flex items-center gap-1.5 text-red-500 font-semibold">
+            <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+            {t.broadcasting}
+          </div>
+        )}
+        {role === "client" && guidePresent && !audioConnected && (
+          <div className="flex items-center gap-1.5 text-blue-600">
+            <MapPin className="w-4 h-4" />
+            {t.waiting}
+          </div>
+        )}
+      </div>
 
-            <div className="flex gap-4">
-              <Button 
-                onClick={isBroadcasting ? stopBroadcasting : startBroadcasting}
-                className={`flex-1 h-16 rounded-2xl text-lg font-bold transition-all duration-300 ${
-                  isBroadcasting 
-                  ? "bg-zinc-800 hover:bg-zinc-700 text-white" 
-                  : "bg-orange-600 hover:bg-orange-700 text-white shadow-lg shadow-orange-600/20"
-                }`}
-              >
-                {isBroadcasting ? (
-                  <>
-                    <MicOff className="mr-2 w-6 h-6" /> Termina
-                  </>
-                ) : (
-                  <>
-                    <Mic className="mr-2 w-6 h-6" /> Inizia Trasmissione
-                  </>
-                )}
-              </Button>
-            </div>
-          </motion.div>
+      {/* Tab bar */}
+      <div className="flex border-b border-blue-100 mx-4">
+        {(["map", "chat", "photos"] as const).map((tb) => (
+          <button key={tb} onClick={() => setTab(tb)}
+            className={`flex-1 py-2.5 text-sm font-semibold flex items-center justify-center gap-1.5 border-b-2 transition-colors ${tab === tb ? "border-blue-600 text-blue-700" : "border-transparent text-gray-500 hover:text-gray-700"}`}>
+            {tb === "map" && <><MapPin className="w-4 h-4" />{t.map}</>}
+            {tb === "chat" && <><MessageCircle className="w-4 h-4" />{t.chat} {chatMessages.length > 0 && <span className="bg-blue-600 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center">{chatMessages.length}</span>}</>}
+            {tb === "photos" && <><Image className="w-4 h-4" />{t.sendPhoto} {photos.length > 0 && <span className="bg-blue-600 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center">{photos.length}</span>}</>}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab content */}
+      <div className="flex-1 overflow-hidden relative">
+        {/* MAP */}
+        <div className={`absolute inset-0 ${tab === "map" ? "" : "hidden"}`}>
+          {import.meta.env.VITE_MAPBOX_ACCESS_TOKEN
+            ? <div ref={mapContainerRef} className="w-full h-full" />
+            : <div className="flex items-center justify-center h-full p-6 text-center text-gray-500 text-sm">{t.noMapToken}</div>}
         </div>
-      </main>
+
+        {/* CHAT */}
+        <AnimatePresence>
+          {tab === "chat" && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute inset-0 flex flex-col">
+              <div className="flex-1 overflow-y-auto p-4 space-y-3">
+                {chatMessages.map((msg) => (
+                  <div key={msg.id} className={`flex ${msg.author === username ? "justify-end" : "justify-start"}`}>
+                    <div className={`max-w-[80%] rounded-2xl px-4 py-2.5 shadow-sm ${msg.role === "guide" ? "bg-blue-700 text-white" : msg.author === username ? "bg-blue-500 text-white" : "bg-white text-gray-800 border border-blue-100"}`}>
+                      {msg.author !== username && <div className="text-xs font-semibold mb-1 opacity-70">{msg.author}</div>}
+                      <div className="text-sm">{msg.message}</div>
+                      <div className="text-xs opacity-50 mt-1 text-right">{new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</div>
+                    </div>
+                  </div>
+                ))}
+                <div ref={chatBottomRef} />
+              </div>
+              <div className="p-3 flex gap-2 border-t border-blue-100 bg-white">
+                <input value={chatInput} onChange={(e) => setChatInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && sendChat()}
+                  placeholder={t.typeMessage}
+                  className="flex-1 px-4 py-2.5 rounded-2xl border border-blue-200 focus:outline-none focus:ring-2 focus:ring-blue-400 text-sm bg-blue-50" />
+                <button onClick={sendChat} disabled={!chatInput.trim()}
+                  className="w-11 h-11 rounded-2xl bg-blue-600 text-white flex items-center justify-center disabled:opacity-40">
+                  <Send className="w-4 h-4" />
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* PHOTOS */}
+        <AnimatePresence>
+          {tab === "photos" && (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="absolute inset-0 overflow-y-auto p-4 space-y-4">
+              {photos.length === 0
+                ? <div className="flex flex-col items-center justify-center h-full text-gray-400 gap-3">
+                    <Image className="w-12 h-12 opacity-30" />
+                    <p className="text-sm">Nessuna foto ancora</p>
+                  </div>
+                : photos.map((p, i) => (
+                  <motion.div key={i} initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}
+                    className="rounded-2xl overflow-hidden shadow-md bg-white">
+                    <img src={p.dataUrl} alt={p.caption} className="w-full object-cover max-h-72" />
+                    {p.caption && <div className="px-4 py-2 text-sm text-gray-700">{p.caption}</div>}
+                    <div className="px-4 pb-3 text-xs text-gray-400">{new Date(p.timestamp).toLocaleTimeString()}</div>
+                  </motion.div>
+                ))}
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* Photo preview modal */}
+      <AnimatePresence>
+        {photoPreview && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex flex-col bg-black/80 p-4">
+            <button onClick={() => { setPhotoPreview(null); setPhotoCaption(""); }}
+              className="self-end p-2 text-white mb-3"><X className="w-6 h-6" /></button>
+            <img src={photoPreview} alt="" className="rounded-2xl max-h-64 object-cover w-full mb-4" />
+            <input value={photoCaption} onChange={(e) => setPhotoCaption(e.target.value)}
+              placeholder={t.photoCaption}
+              className="w-full px-4 py-3 rounded-2xl bg-white/10 text-white placeholder-white/40 border border-white/20 focus:outline-none mb-3 text-sm" />
+            <button onClick={sendPhoto} className="w-full py-3 rounded-2xl bg-blue-600 text-white font-bold">{t.sendPhotoBtn}</button>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
-
-// --- CLIENT VIEW ---
-function ClientView({ roomId, onLeave }: { roomId: string; onLeave: () => void }) {
-  const [guideLocation, setGuideLocation] = useState<{ lat: number; lng: number } | null>(null);
-  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
-  const [isGuideOnline, setIsGuideOnline] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState<"idle" | "connecting" | "connected" | "failed">("idle");
-  const [mapError, setMapError] = useState<string | null>(null);
-  const [logs, setLogs] = useState<string[]>([]);
-  
-  const addLog = (msg: string) => {
-    const timestamp = new Date().toLocaleTimeString();
-    console.log(`[EXPERT ${timestamp}] ${msg}`);
-    setLogs(prev => [`${timestamp}: ${msg}`, ...prev].slice(0, 8));
-  };
-
-  const socketRef = useRef<Socket | null>(null);
-  const pcRef = useRef<RTCPeerConnection | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const mapRef = useRef<HTMLDivElement>(null);
-  const mapInstanceRef = useRef<mapboxgl.Map | null>(null);
-  const markerRef = useRef<mapboxgl.Marker | null>(null);
-  const pendingIceCandidates = useRef<RTCIceCandidateInit[]>([]);
-
-  useEffect(() => {
-    addLog("Inizializzazione client...");
-    socketRef.current = io();
-    const socket = socketRef.current;
-    // ... rest of the socket logic should use addLog
-
-    socket.on("connect", () => console.log("Socket connected:", socket.id));
-    socket.on("disconnect", () => {
-      console.log("Socket disconnected");
-      setIsGuideOnline(false);
-    });
-
-    socket.emit("join-room", roomId, "client");
-
-    socket.on("guide-joined", () => setIsGuideOnline(true));
-    socket.on("guide-left", () => {
-      setIsGuideOnline(false);
-      setGuideLocation(null);
-      setIsAudioPlaying(false);
-      setConnectionStatus("idle");
-    });
-
-    socket.on("broadcast-started", (guideId: string) => {
-      addLog("Guida ha iniziato trasmissione");
-      setConnectionStatus("connecting");
-    });
-
-    socket.on("broadcast-stopped", () => {
-      addLog("Trasmissione terminata");
-      setIsAudioPlaying(false);
-      setConnectionStatus("idle");
-      if (pcRef.current) {
-        pcRef.current.close();
-        pcRef.current = null;
-      }
-      if (audioRef.current) {
-        audioRef.current.srcObject = null;
-      }
-      pendingIceCandidates.current = [];
-    });
-
-    socket.on("location-updated", ({ location }) => {
-      setGuideLocation(location);
-      setIsGuideOnline(true);
-      if (mapInstanceRef.current) {
-        mapInstanceRef.current.panTo([location.lng, location.lat]);
-        if (markerRef.current) {
-          markerRef.current.setLngLat([location.lng, location.lat]);
-        }
-      }
-    });
-
-    socket.on("offer", async ({ sender, offer }) => {
-      addLog("Ricevuta offerta WebRTC...");
-      setConnectionStatus("connecting");
-      
-      if (pcRef.current) {
-        pcRef.current.close();
-      }
-
-      const pc = new RTCPeerConnection(ICE_SERVERS);
-      pcRef.current = pc;
-
-      pc.oniceconnectionstatechange = () => {
-        const state = pc.iceConnectionState;
-        addLog(`Stato rete: ${state}`);
-        if (state === "connected" || state === "completed") {
-          setConnectionStatus("connected");
-        }
-        if (state === "failed" || state === "disconnected") {
-          setConnectionStatus("failed");
-        }
-      };
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          socket.emit("ice-candidate", { target: sender, candidate: event.candidate });
-        }
-      };
-
-      pc.ontrack = (event) => {
-        addLog("Flusso audio agganciato!");
-        if (audioRef.current) {
-          const remoteStream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
-          audioRef.current.srcObject = remoteStream;
-          
-          // Trick: Play muted first then unmute on user interaction if needed
-          audioRef.current.play().then(() => {
-            addLog("Successo: Audio in onda");
-            setIsAudioPlaying(true);
-            setConnectionStatus("connected");
-          }).catch(e => {
-            addLog(`Blocco browser: ${e.name}`);
-            console.warn("[EXPERT] Autoplay blocked, waiting for button:", e);
-          });
-        }
-      };
-
-      try {
-        await pc.setRemoteDescription(new RTCSessionDescription(offer));
-        
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit("answer", { target: sender, answer });
-        
-        // Add pending candidates AFTER setting remote description
-        const candidates = [...pendingIceCandidates.current];
-        pendingIceCandidates.current = [];
-        for (const candidate of candidates) {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          } catch (e) {
-            console.error("Error adding queued candidate:", e);
-          }
-        }
-      } catch (err) {
-        addLog("Errore negoziazione");
-        console.error("WebRTC Error:", err);
-        setConnectionStatus("failed");
-      }
-    });
-
-    socket.on("ice-candidate", async ({ candidate }) => {
-      if (pcRef.current && pcRef.current.remoteDescription) {
-        try {
-          await pcRef.current.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) {
-          console.error("Error adding ice candidate:", e);
-        }
-      } else {
-        pendingIceCandidates.current.push(candidate);
-      }
-    });
-
-    // Load Mapbox
-    const token = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN;
-    console.log("Mapbox Token present (Client):", !!token);
-
-    if (token && mapRef.current) {
-      try {
-        mapboxgl.accessToken = token;
-        const map = new mapboxgl.Map({
-          container: mapRef.current,
-          style: "mapbox://styles/mapbox/dark-v11",
-          center: [12.4964, 41.9028], // Default Rome
-          zoom: 17,
-          attributionControl: false,
-        });
-
-        mapInstanceRef.current = map;
-
-        const el = document.createElement('div');
-        el.className = 'w-8 h-8 bg-orange-500 rounded-full border-4 border-white shadow-lg';
-        
-        markerRef.current = new mapboxgl.Marker(el)
-          .setLngLat([12.4964, 41.9028])
-          .addTo(map);
-
-        map.on('load', () => {
-          console.log("Mapbox loaded successfully (Client)");
-          map.resize();
-        });
-
-        map.on('error', (e) => {
-          console.error("Mapbox Error:", e);
-          setMapError("Errore nel caricamento di Mapbox. Verifica il tuo Access Token.");
-        });
-      } catch (err) {
-        console.error("Mapbox Init Error:", err);
-        setMapError("Errore nell'inizializzazione della mappa.");
-      }
-    } else if (!token) {
-      setMapError("Mapbox Access Token mancante.");
-    }
-
-    return () => {
-      socket.disconnect();
-      pcRef.current?.close();
-      mapInstanceRef.current?.remove();
-    };
-  }, [roomId]);
-
-  return (
-    <div className="h-screen flex flex-col bg-zinc-950 text-zinc-100 overflow-hidden">
-      <audio ref={audioRef} autoPlay playsInline />
-      
-      {/* Header */}
-      <header className="p-4 border-b border-zinc-800 flex items-center justify-between bg-zinc-900/50 backdrop-blur-md z-10">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 bg-orange-600 rounded-xl flex items-center justify-center">
-            <Radio className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <h1 className="font-bold text-lg">TourGuide Live</h1>
-            <div className="flex items-center gap-2">
-              <Badge variant="outline" className="text-[10px] border-zinc-700 text-zinc-400">
-                GRUPPO: {roomId}
-              </Badge>
-              <Badge variant="secondary" className={`text-[10px] ${isGuideOnline ? "bg-green-500/10 text-green-500" : "bg-zinc-800 text-zinc-500"}`}>
-                {isGuideOnline ? "GUIDA ONLINE" : "GUIDA OFFLINE"}
-              </Badge>
-            </div>
-          </div>
-        </div>
-        <Button variant="ghost" size="sm" onClick={onLeave} className="text-zinc-400 hover:text-white">
-          Esci
-        </Button>
-      </header>
-
-      {/* Main Content */}
-      <main className="flex-1 relative">
-        {/* Map Background */}
-        <div ref={mapRef} className="absolute inset-0 z-0" />
-        
-        {/* Map Error Overlay */}
-        {mapError && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-zinc-950/80 backdrop-blur-sm p-6 text-center">
-            <div className="max-w-xs space-y-4">
-              <div className="mx-auto w-12 h-12 bg-amber-500/20 rounded-full flex items-center justify-center">
-                <Info className="w-6 h-6 text-amber-500" />
-              </div>
-              <p className="text-sm text-zinc-300">{mapError}</p>
-              <Button variant="outline" size="sm" onClick={() => window.location.reload()} className="border-zinc-800">
-                Riprova
-              </Button>
-            </div>
-          </div>
-        )}
-        
-        {/* Overlay Status */}
-        <div className="absolute top-4 left-4 right-4 z-10">
-          <AnimatePresence>
-            {isGuideOnline && (
-              <motion.div 
-                initial={{ opacity: 0, y: -20 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -20 }}
-                className={`${isAudioPlaying ? "bg-green-600/90" : "bg-orange-600/90"} backdrop-blur-md text-white p-3 rounded-xl flex items-center justify-between shadow-lg`}
-              >
-                <div className="flex items-center gap-2">
-                  <Info className="w-4 h-4" />
-                  <span className="text-sm font-medium">
-                    {!isAudioPlaying ? (
-                      connectionStatus === "connecting" ? "Sincronizzazione segnale in corso..." :
-                      connectionStatus === "failed" ? "Connessione fallita. Riprova." :
-                      "In attesa dell'audio dalla guida..."
-                    ) : "Audio Live Attivo"}
-                  </span>
-                </div>
-                {isAudioPlaying && (
-                  <div className="flex gap-1">
-                    {[1, 2, 3].map((i) => (
-                      <motion.div
-                        key={i}
-                        animate={{ height: [4, 12, 4] }}
-                        transition={{ repeat: Infinity, duration: 0.5, delay: i * 0.1 }}
-                        className="w-1 bg-white rounded-full"
-                      />
-                    ))}
-                  </div>
-                )}
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-
-        {/* Bottom Panel */}
-        <div className="absolute bottom-8 left-0 right-0 px-4 z-10">
-          <motion.div 
-            initial={{ y: 20, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            className="bg-zinc-900/90 backdrop-blur-xl border border-zinc-800 rounded-3xl p-6 shadow-2xl max-w-lg mx-auto w-full"
-          >
-            {isGuideOnline && (
-              <div className="space-y-4">
-                <Button 
-                  onClick={async () => {
-                    addLog("Interazione utente: Sblocco...");
-                    if (audioRef.current) {
-                      try {
-                        // Crucial sequence for mobile browsers
-                        audioRef.current.muted = false;
-                        const playPromise = audioRef.current.play();
-                        if (playPromise !== undefined) {
-                          await playPromise;
-                          addLog("Audio connesso e attivo");
-                          setIsAudioPlaying(true);
-                        }
-                      } catch (e) {
-                        addLog(`Errore sblocco: ${e instanceof Error ? e.message : 'Unknown'}`);
-                        console.error("Playback failed:", e);
-                      }
-                    }
-                  }}
-                  className={`w-full font-bold h-12 rounded-xl transition-all ${
-                    isAudioPlaying 
-                    ? "bg-zinc-800 text-zinc-400 hover:bg-zinc-700" 
-                    : "bg-orange-600 hover:bg-orange-700 text-white shadow-lg shadow-orange-600/20"
-                  }`}
-                >
-                  <Play className="mr-2 w-5 h-5" /> 
-                  {isAudioPlaying ? "Riavvia Audio Live" : "Attiva Audio Live"}
-                </Button>
-
-                {/* Diagnostic Logs */}
-                <div className="bg-black/50 rounded-xl p-3 border border-zinc-800">
-                  <div className="flex items-center gap-2 mb-2 text-zinc-500 text-[10px] uppercase font-bold tracking-wider">
-                    <Info className="w-3 h-3" /> Diagnostica Connessione
-                  </div>
-                  <div className="space-y-1">
-                    {logs.map((log, i) => (
-                      <div key={i} className="text-[11px] text-zinc-400 font-mono">
-                        <span className="text-orange-500/50 mr-2">[{i}]</span> {log}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-3">
-                <div className={`w-12 h-12 rounded-full flex items-center justify-center ${isAudioPlaying ? "bg-orange-500/20 text-orange-500" : "bg-zinc-800 text-zinc-500"}`}>
-                  {isAudioPlaying ? <Radio className="w-6 h-6 animate-pulse" /> : <MicOff className="w-6 h-6" />}
-                </div>
-                <div>
-                  <p className="font-bold">{isAudioPlaying ? "Ascolto in corso" : "Silenzio"}</p>
-                  <p className="text-xs text-zinc-500">Volume controllato dal dispositivo</p>
-                </div>
-              </div>
-              <Button 
-                variant="outline" 
-                size="icon" 
-                className="rounded-full border-zinc-700 hover:bg-zinc-800"
-                onClick={() => {
-                  if (audioRef.current) {
-                    audioRef.current.muted = !audioRef.current.muted;
-                  }
-                }}
-              >
-                <Settings className="w-4 h-4" />
-              </Button>
-            </div>
-            
-            <div className="h-1 bg-zinc-800 rounded-full overflow-hidden">
-              {isAudioPlaying && (
-                <motion.div 
-                  className="h-full bg-orange-500"
-                  animate={{ width: ["20%", "60%", "40%", "80%", "30%"] }}
-                  transition={{ repeat: Infinity, duration: 2 }}
-                />
-              )}
-            </div>
-          </motion.div>
-        </div>
-      </main>
-    </div>
-  );
-}
-
-// Map Styles
-// Mapbox styles are handled via style URLs (e.g., mapbox://styles/mapbox/dark-v11)
