@@ -1,7 +1,6 @@
 import { useRef, useCallback } from "react";
-import { Socket } from "socket.io-client";
+import type { Socket } from "socket.io-client";
 
-// Public STUN servers + free TURN fallback
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
@@ -16,44 +15,48 @@ const ICE_SERVERS: RTCIceServer[] = [
     username: "openrelayproject",
     credential: "openrelayproject",
   },
+  {
+    urls: "turn:openrelay.metered.ca:443?transport=tcp",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
 ];
 
-export function useWebRTC(socket: Socket | null) {
+// Takes a REF to socket so it always uses the latest value
+export function useWebRTC(socketRef: React.MutableRefObject<Socket | null>) {
   const peerConnections = useRef<Map<string, RTCPeerConnection>>(new Map());
   const pendingCandidates = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
-  const localStreamRef = useRef<MediaStream | null>(null);
 
   const createPeerConnection = useCallback(
     (targetId: string, onRemoteStream?: (stream: MediaStream) => void): RTCPeerConnection => {
-      // Close existing if any
       const existing = peerConnections.current.get(targetId);
-      if (existing) {
-        existing.close();
-        peerConnections.current.delete(targetId);
-      }
+      if (existing) { existing.close(); peerConnections.current.delete(targetId); }
 
       const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-      // ICE candidate handler — queue until remoteDescription is set
       pc.onicecandidate = (event) => {
-        if (event.candidate && socket) {
-          socket.emit("ice-candidate", { target: targetId, candidate: event.candidate.toJSON() });
+        if (event.candidate && socketRef.current) {
+          socketRef.current.emit("ice-candidate", {
+            target: targetId,
+            candidate: event.candidate.toJSON(),
+          });
         }
       };
 
       pc.oniceconnectionstatechange = () => {
-        console.log(`[ICE ${targetId}] ${pc.iceConnectionState}`);
-        if (pc.iceConnectionState === "failed") {
-          pc.restartIce();
-        }
+        console.log(`[ICE ${targetId.slice(0,6)}] ${pc.iceConnectionState}`);
+        if (pc.iceConnectionState === "failed") pc.restartIce();
         if (pc.iceConnectionState === "disconnected") {
-          // Attempt reconnect after 3s
           setTimeout(() => {
-            if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed") {
+            if (pc.iceConnectionState !== "connected" && pc.iceConnectionState !== "completed") {
               pc.restartIce();
             }
           }, 3000);
         }
+      };
+
+      pc.onconnectionstatechange = () => {
+        console.log(`[PC ${targetId.slice(0,6)}] ${pc.connectionState}`);
       };
 
       pc.ontrack = (event) => {
@@ -65,45 +68,35 @@ export function useWebRTC(socket: Socket | null) {
       peerConnections.current.set(targetId, pc);
       return pc;
     },
-    [socket]
+    [socketRef]
   );
 
-  const addLocalTracks = useCallback(
-    (pc: RTCPeerConnection, stream: MediaStream) => {
-      stream.getTracks().forEach((track) => {
-        pc.addTrack(track, stream);
-      });
-    },
-    []
-  );
-
-  // Guide: send offer to a client
   const sendOffer = useCallback(
     async (targetId: string, stream: MediaStream) => {
-      if (!socket) return;
+      if (!socketRef.current) { console.warn("sendOffer: no socket"); return; }
       const pc = createPeerConnection(targetId);
-      addLocalTracks(pc, stream);
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
-      const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
+      const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      socket.emit("offer", { target: targetId, offer: pc.localDescription });
+      socketRef.current.emit("offer", { target: targetId, offer: pc.localDescription });
+      console.log(`[WebRTC] Offer sent to ${targetId.slice(0,6)}`);
     },
-    [socket, createPeerConnection, addLocalTracks]
+    [socketRef, createPeerConnection]
   );
 
-  // Client: handle incoming offer
   const handleOffer = useCallback(
     async (
       senderId: string,
       offer: RTCSessionDescriptionInit,
       onRemoteStream: (stream: MediaStream) => void
     ) => {
-      if (!socket) return;
+      if (!socketRef.current) { console.warn("handleOffer: no socket"); return; }
       const pc = createPeerConnection(senderId, onRemoteStream);
 
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
 
-      // Flush pending ICE candidates
+      // Flush queued ICE candidates
       const pending = pendingCandidates.current.get(senderId) || [];
       for (const c of pending) {
         await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
@@ -112,29 +105,26 @@ export function useWebRTC(socket: Socket | null) {
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      socket.emit("answer", { target: senderId, answer: pc.localDescription });
+      socketRef.current.emit("answer", { target: senderId, answer: pc.localDescription });
+      console.log(`[WebRTC] Answer sent to ${senderId.slice(0,6)}`);
     },
-    [socket, createPeerConnection]
+    [socketRef, createPeerConnection]
   );
 
-  // Guide: handle answer from client
-  const handleAnswer = useCallback(
-    async (senderId: string, answer: RTCSessionDescriptionInit) => {
-      const pc = peerConnections.current.get(senderId);
-      if (!pc || pc.signalingState !== "have-local-offer") return;
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+  const handleAnswer = useCallback(async (senderId: string, answer: RTCSessionDescriptionInit) => {
+    const pc = peerConnections.current.get(senderId);
+    if (!pc) { console.warn("handleAnswer: no pc for", senderId.slice(0,6)); return; }
+    if (pc.signalingState !== "have-local-offer") return;
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
 
-      // Flush pending candidates
-      const pending = pendingCandidates.current.get(senderId) || [];
-      for (const c of pending) {
-        await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
-      }
-      pendingCandidates.current.delete(senderId);
-    },
-    []
-  );
+    const pending = pendingCandidates.current.get(senderId) || [];
+    for (const c of pending) {
+      await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
+    }
+    pendingCandidates.current.delete(senderId);
+    console.log(`[WebRTC] Answer handled from ${senderId.slice(0,6)}`);
+  }, []);
 
-  // Handle incoming ICE candidate — queue if remoteDescription not set yet
   const handleIceCandidate = useCallback(async (senderId: string, candidate: RTCIceCandidateInit) => {
     const pc = peerConnections.current.get(senderId);
     if (!pc || !pc.remoteDescription) {
@@ -150,19 +140,7 @@ export function useWebRTC(socket: Socket | null) {
     peerConnections.current.forEach((pc) => pc.close());
     peerConnections.current.clear();
     pendingCandidates.current.clear();
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((t) => t.stop());
-      localStreamRef.current = null;
-    }
   }, []);
 
-  return {
-    sendOffer,
-    handleOffer,
-    handleAnswer,
-    handleIceCandidate,
-    closeAll,
-    localStreamRef,
-    peerConnections,
-  };
+  return { sendOffer, handleOffer, handleAnswer, handleIceCandidate, closeAll, peerConnections };
 }
