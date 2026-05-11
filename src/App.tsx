@@ -2,10 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
-import {
-  Mic, MicOff, MapPin, Users, Radio, Camera,
-  MessageCircle, Send, X, Image, Wifi, WifiOff, LogOut
-} from "lucide-react";
+import { Mic, MicOff, MapPin, Radio, Camera, MessageCircle, Send, X, Image, Wifi, WifiOff, LogOut } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { requestNotificationPermission, showLocalNotification } from "./hooks/useNotifications";
 import { useWebRTC } from "./hooks/useWebRTC";
@@ -17,7 +14,7 @@ const T = {
     joinAsGuide: "Guida", joinAsClient: "Partecipante", join: "Entra",
     guide: "Guida", client: "Partecipante",
     startBroadcast: "Inizia Trasmissione", stopBroadcast: "Ferma Trasmissione",
-    broadcasting: "In trasmissione", waiting: "In attesa...",
+    broadcasting: "In trasmissione", waiting: "In attesa della guida...",
     connected: "Connesso", disconnected: "Disconnesso", clients: "Partecipanti",
     sendPhoto: "Foto", chat: "Chat", map: "Mappa",
     typeMessage: "Scrivi un messaggio...", send: "Invia",
@@ -26,8 +23,9 @@ const T = {
     roomFull: "Gruppo pieno (max 100)", leave: "Esci",
     micPermission: "Permesso microfono negato", guideLabel: "👨‍✈️ Guida", youLabel: "Tu",
     photoCaption: "Aggiungi una didascalia...", sendPhotoBtn: "Invia Foto", cancel: "Annulla",
-    noMapToken: "Mappa non disponibile: configura VITE_MAPBOX_ACCESS_TOKEN",
-    audioConnected: "Audio connesso", audioWaiting: "In attesa audio...",
+    noMapToken: "Mappa non disponibile",
+    audioConnected: "🟢 Audio connesso", audioWaiting: "⏳ In attesa audio...",
+    connectingServer: "Connessione al server...",
   },
   en: {
     appTagline: "Real-time audio & GPS for your tour",
@@ -35,17 +33,18 @@ const T = {
     joinAsGuide: "Guide", joinAsClient: "Participant", join: "Join",
     guide: "Guide", client: "Participant",
     startBroadcast: "Start Broadcast", stopBroadcast: "Stop Broadcast",
-    broadcasting: "Broadcasting", waiting: "Waiting...",
+    broadcasting: "Broadcasting", waiting: "Waiting for guide...",
     connected: "Connected", disconnected: "Disconnected", clients: "Participants",
     sendPhoto: "Photos", chat: "Chat", map: "Map",
     typeMessage: "Type a message...", send: "Send",
-    guideJoined: "Guide has joined", guideLeft: "Guide has left the room",
+    guideJoined: "Guide has joined", guideLeft: "Guide has left",
     broadcastStarted: "Broadcast started!", broadcastStopped: "Broadcast stopped",
     roomFull: "Group full (max 100)", leave: "Leave",
     micPermission: "Microphone permission denied", guideLabel: "👨‍✈️ Guide", youLabel: "You",
     photoCaption: "Add a caption...", sendPhotoBtn: "Send Photo", cancel: "Cancel",
-    noMapToken: "Map unavailable: set VITE_MAPBOX_ACCESS_TOKEN",
-    audioConnected: "Audio connected", audioWaiting: "Waiting for audio...",
+    noMapToken: "Map unavailable",
+    audioConnected: "🟢 Audio connected", audioWaiting: "⏳ Waiting for audio...",
+    connectingServer: "Connecting to server...",
   },
 };
 
@@ -65,6 +64,7 @@ export default function App() {
   const [clientCount, setClientCount] = useState(0);
   const [guidePresent, setGuidePresent] = useState(false);
   const [audioConnected, setAudioConnected] = useState(false);
+  const [socketConnected, setSocketConnected] = useState(false);
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [tab, setTab] = useState<"map" | "chat" | "photos">("map");
   const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
@@ -74,9 +74,8 @@ export default function App() {
   const [photoCaption, setPhotoCaption] = useState("");
   const [username, setUsername] = useState("");
 
-  // KEY FIX: pass the REF, not .current
   const socketRef = useRef<Socket | null>(null);
-  const { sendOffer, handleOffer, handleAnswer, handleIceCandidate, closeAll, peerConnections } =
+  const { sendOffer, handleOffer, handleAnswer, handleIceCandidate, closeAll } =
     useWebRTC(socketRef);
 
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -87,6 +86,8 @@ export default function App() {
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const isBroadcastingRef = useRef(false);
+  const roleRef = useRef<Role>(null);
+  const roomIdRef = useRef("");
 
   useEffect(() => {
     const up = () => setIsOnline(true);
@@ -96,51 +97,76 @@ export default function App() {
     return () => { window.removeEventListener("online", up); window.removeEventListener("offline", dn); };
   }, []);
 
+  // CRITICAL FIX: register all events after socket is created and stored in ref
   useEffect(() => {
     if (!isJoined) return;
+
     const socket = io(window.location.origin, {
       transports: ["websocket", "polling"],
       reconnection: true,
-      reconnectionAttempts: 10,
+      reconnectionAttempts: 15,
       reconnectionDelay: 1000,
     });
-    socketRef.current = socket;
-    socket.emit("join-room", roomId, role);
 
-    socket.on("connect", () => console.log("[Socket] connected", socket.id));
-    socket.on("disconnect", (reason) => console.log("[Socket] disconnected", reason));
+    // Store in ref IMMEDIATELY before registering any events
+    socketRef.current = socket;
+
+    // Only emit join-room after socket is confirmed connected
+    socket.on("connect", () => {
+      console.log("[Socket] connected:", socket.id);
+      setSocketConnected(true);
+      // Join room only after connection confirmed
+      socket.emit("join-room", roomIdRef.current, roleRef.current);
+    });
+
+    socket.on("disconnect", (reason) => {
+      console.log("[Socket] disconnected:", reason);
+      setSocketConnected(false);
+    });
 
     socket.on("room-info", (info: { guidePresent: boolean; broadcastActive: boolean; clientCount: number }) => {
       setGuidePresent(info.guidePresent);
       setClientCount(info.clientCount);
     });
+
     socket.on("room-clients", (clients: string[]) => setClientCount(clients.length));
 
     socket.on("client-joined", (clientId: string) => {
       setClientCount((n) => n + 1);
       if (isBroadcastingRef.current && localStreamRef.current) {
+        console.log("[WebRTC] New client joined, sending offer to:", clientId.slice(0,6));
         sendOffer(clientId, localStreamRef.current);
       }
     });
+
     socket.on("client-left", () => setClientCount((n) => Math.max(0, n - 1)));
 
+    // Guide receives this when a client joins while already broadcasting
     socket.on("send-offer-to", (clientId: string) => {
-      if (localStreamRef.current) sendOffer(clientId, localStreamRef.current);
+      console.log("[WebRTC] send-offer-to:", clientId.slice(0,6));
+      if (localStreamRef.current) {
+        sendOffer(clientId, localStreamRef.current);
+      } else {
+        console.warn("[WebRTC] send-offer-to: no local stream yet");
+      }
     });
 
     socket.on("offer", async ({ sender, offer }: { sender: string; offer: RTCSessionDescriptionInit }) => {
+      console.log("[WebRTC] Received offer from:", sender.slice(0,6));
       await handleOffer(sender, offer, (stream) => {
+        console.log("[WebRTC] Got remote stream ✅");
         setAudioConnected(true);
         if (!audioRef.current) {
           audioRef.current = new Audio();
           audioRef.current.autoplay = true;
         }
         audioRef.current.srcObject = stream;
-        audioRef.current.play().catch(console.warn);
+        audioRef.current.play().catch(e => console.warn("[Audio] play error:", e));
       });
     });
 
     socket.on("answer", ({ sender, answer }: { sender: string; answer: RTCSessionDescriptionInit }) => {
+      console.log("[WebRTC] Received answer from:", sender.slice(0,6));
       handleAnswer(sender, answer);
     });
 
@@ -152,21 +178,31 @@ export default function App() {
       setGuidePresent(true);
       showLocalNotification("Tony's Family", t.guideJoined);
     });
+
     socket.on("guide-left", () => {
       setGuidePresent(false);
       setAudioConnected(false);
-      if (audioRef.current) audioRef.current.srcObject = null;
+      if (audioRef.current) { audioRef.current.srcObject = null; }
     });
-    socket.on("broadcast-started", () => showLocalNotification("Tony's Family", t.broadcastStarted));
+
+    socket.on("broadcast-started", () => {
+      showLocalNotification("Tony's Family", t.broadcastStarted);
+    });
+
     socket.on("broadcast-stopped", () => {
       setAudioConnected(false);
-      if (audioRef.current) audioRef.current.srcObject = null;
+      if (audioRef.current) { audioRef.current.srcObject = null; }
     });
+
     socket.on("chat-message", (msg: ChatMsg) => setChatMessages((prev) => [...prev, msg]));
     socket.on("photo-received", (photo: PhotoMsg) => setPhotos((prev) => [photo, ...prev]));
     socket.on("room-full", () => alert(t.roomFull));
 
-    return () => { socket.disconnect(); closeAll(); };
+    return () => {
+      socket.disconnect();
+      closeAll();
+      socketRef.current = null;
+    };
   }, [isJoined]); // eslint-disable-line
 
   useEffect(() => { chatBottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatMessages]);
@@ -214,6 +250,8 @@ export default function App() {
     await requestNotificationPermission();
     const uname = role === "guide" ? t.guideLabel : `${t.client} ${Math.floor(Math.random() * 900 + 100)}`;
     setUsername(uname);
+    roomIdRef.current = roomId;
+    roleRef.current = role;
     setIsJoined(true);
   }, [roomId, role, t]);
 
@@ -224,7 +262,11 @@ export default function App() {
       isBroadcastingRef.current = true;
       setIsBroadcasting(true);
       socketRef.current?.emit("start-broadcast", roomId);
-    } catch { alert(t.micPermission); }
+      console.log("[Guide] Broadcast started, emitting start-broadcast for room:", roomId);
+    } catch (e) {
+      console.error("[Guide] Mic error:", e);
+      alert(t.micPermission);
+    }
   }, [roomId, t]);
 
   const handleStopBroadcast = useCallback(() => {
@@ -265,23 +307,25 @@ export default function App() {
   const handleLeave = useCallback(() => {
     closeAll();
     socketRef.current?.disconnect();
+    socketRef.current = null;
     setIsJoined(false); setIsBroadcasting(false);
     isBroadcastingRef.current = false;
-    setAudioConnected(false); setClientCount(0);
+    setAudioConnected(false); setClientCount(0); setSocketConnected(false);
     setChatMessages([]); setPhotos([]);
     localStreamRef.current?.getTracks().forEach(t => t.stop());
     localStreamRef.current = null;
   }, [closeAll]);
 
+  // ────── JOIN SCREEN ──────
   if (!isJoined) {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center p-4"
         style={{ background: "linear-gradient(160deg, #0a3d62 0%, #1a6fa8 50%, #2980b9 100%)" }}>
         <div style={{ position: "absolute", top: 16, right: 16, display: "flex", gap: 8 }}>
           {(["it", "en"] as Lang[]).map((l) => (
-            <button key={l} onClick={() => setLang(l)}
-              style={{ padding: "4px 12px", borderRadius: 999, fontSize: 12, fontWeight: 700, border: "none", cursor: "pointer",
-                background: lang === l ? "white" : "rgba(255,255,255,.2)", color: lang === l ? "#0a3d62" : "white" }}>
+            <button key={l} onClick={() => setLang(l)} style={{
+              padding: "4px 12px", borderRadius: 999, fontSize: 12, fontWeight: 700, border: "none", cursor: "pointer",
+              background: lang === l ? "white" : "rgba(255,255,255,.2)", color: lang === l ? "#0a3d62" : "white" }}>
               {l.toUpperCase()}
             </button>
           ))}
@@ -308,8 +352,7 @@ export default function App() {
               placeholder={t.groupPlaceholder} maxLength={12} onKeyDown={(e) => e.key === "Enter" && handleJoin()}
               style={{ width: "100%", padding: 14, borderRadius: 16, background: "rgba(255,255,255,.15)",
                 border: "1px solid rgba(255,255,255,.25)", color: "white", fontSize: 18,
-                fontFamily: "monospace", letterSpacing: 4, textAlign: "center", marginBottom: 16,
-                outline: "none" }} />
+                fontFamily: "monospace", letterSpacing: 4, textAlign: "center", marginBottom: 16, outline: "none" }} />
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
               {(["guide", "client"] as const).map((r) => (
                 <button key={r} onClick={() => setRole(r)} style={{
@@ -318,8 +361,7 @@ export default function App() {
                   fontWeight: 600, fontSize: 14, transition: "all .2s", border: "none",
                   background: role === r ? "white" : "rgba(255,255,255,.1)",
                   color: role === r ? "#0a3d62" : "white",
-                  transform: role === r ? "scale(1.04)" : "scale(1)",
-                }}>
+                  transform: role === r ? "scale(1.04)" : "scale(1)" }}>
                   {r === "guide"
                     ? <svg width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>
                     : <svg width="24" height="24" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>}
@@ -339,6 +381,7 @@ export default function App() {
     );
   }
 
+  // ────── MAIN APP ──────
   return (
     <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", background: "#f0f7ff" }}>
       <header style={{ background: "linear-gradient(90deg,#0a3d62,#1a6fa8)", color: "white",
@@ -353,17 +396,15 @@ export default function App() {
             <div style={{ fontSize: 11, color: "rgba(186,230,253,.9)", fontFamily: "monospace", letterSpacing: 2 }}>{roomId}</div>
           </div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          {isOnline ? <Wifi size={16} color="#86efac"/> : <WifiOff size={16} color="#fca5a5"/>}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {isOnline
+            ? <Wifi size={16} color={socketConnected ? "#86efac" : "#fbbf24"}/>
+            : <WifiOff size={16} color="#fca5a5"/>}
           {role === "client" && (
-            <div style={{ display: "flex", alignItems: "center", gap: 5, padding: "4px 10px", borderRadius: 999,
-              fontSize: 11, fontWeight: 600,
+            <div style={{ padding: "4px 10px", borderRadius: 999, fontSize: 11, fontWeight: 600,
               background: audioConnected ? "rgba(34,197,94,.25)" : "rgba(255,255,255,.1)",
               color: audioConnected ? "#86efac" : "rgba(255,255,255,.6)" }}>
-              <span style={{ width: 8, height: 8, borderRadius: "50%", display: "inline-block",
-                background: audioConnected ? "#4ade80" : "rgba(255,255,255,.3)",
-                animation: audioConnected ? "pulse 1.5s infinite" : "none" }}/>
-              {audioConnected ? t.audioConnected : t.audioWaiting}
+              {audioConnected ? t.audioConnected : (guidePresent ? t.audioWaiting : "🔴 Guida offline")}
             </div>
           )}
           <button onClick={handleLeave} style={{ background: "rgba(255,255,255,.15)", border: "none",
@@ -406,16 +447,24 @@ export default function App() {
           <span style={{ width: 10, height: 10, background: "#ef4444", borderRadius: "50%",
             animation: "pulse 1.5s infinite", display: "inline-block" }}/>
           <span style={{ color: "#dc2626", fontWeight: 700, fontSize: 13 }}>
-            {t.broadcasting} • {clientCount} {t.clients}
+            🔴 {t.broadcasting} • {clientCount} {t.clients}
           </span>
         </div>
       )}
 
-      {role === "client" && guidePresent && !audioConnected && (
-        <div style={{ margin: "0 16px 8px", padding: "8px 14px", background: "#dbeafe", borderRadius: 14,
+      {role === "client" && !guidePresent && (
+        <div style={{ margin: "0 16px 8px", padding: "10px 14px", background: "#fef3c7", borderRadius: 14,
           display: "flex", alignItems: "center", gap: 8 }}>
-          <MapPin size={14} color="#1a6fa8"/>
-          <span style={{ color: "#1a6fa8", fontSize: 13 }}>{t.waiting}</span>
+          <span style={{ fontSize: 14 }}>⏳</span>
+          <span style={{ color: "#92400e", fontSize: 13, fontWeight: 500 }}>{t.waiting}</span>
+        </div>
+      )}
+
+      {role === "client" && guidePresent && !audioConnected && (
+        <div style={{ margin: "0 16px 8px", padding: "10px 14px", background: "#dbeafe", borderRadius: 14,
+          display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 14 }}>🎙️</span>
+          <span style={{ color: "#1e40af", fontSize: 13 }}>Guida connessa • {t.audioWaiting}</span>
         </div>
       )}
 
@@ -439,7 +488,6 @@ export default function App() {
             ? <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }}/>
             : <div style={{ display:"flex",alignItems:"center",justifyContent:"center",height:"100%",padding:24,textAlign:"center",color:"#94a3b8",fontSize:14}}>{t.noMapToken}</div>}
         </div>
-
         <AnimatePresence>
           {tab === "chat" && (
             <motion.div initial={{opacity:0}} animate={{opacity:1}} style={{position:"absolute",inset:0,display:"flex",flexDirection:"column"}}>
@@ -468,7 +516,6 @@ export default function App() {
             </motion.div>
           )}
         </AnimatePresence>
-
         <AnimatePresence>
           {tab === "photos" && (
             <motion.div initial={{opacity:0}} animate={{opacity:1}} style={{position:"absolute",inset:0,overflowY:"auto",padding:16,display:"flex",flexDirection:"column",gap:16}}>
@@ -503,7 +550,6 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
-
       <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}`}</style>
     </div>
   );
